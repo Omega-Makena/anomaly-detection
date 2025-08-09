@@ -7,12 +7,12 @@
 This system detects anomalous patterns in log files using clustering, dimensionality reduction, and statistical analysis. It processes raw logs, identifies key event templates, and flags suspicious time windows based on reconstruction error metrics.
 
 ## Features
-- 🕒 Time-based windowing of log events
-- ✨ Automatic template generation via K-Means clustering
-- 🔍 PCA-based anomaly detection
-- 📊 Performance evaluation with precision/recall metrics
-- 🧹 Advanced log scrubbing and preprocessing
-- 📈 Adaptive threshold calculation
+- Time-based windowing of log events
+- Automatic template generation via K-Means clustering
+-  PCA-based anomaly detection
+- Performance evaluation with precision/recall metrics
+- Advanced log scrubbing and preprocessing
+- Adaptive threshold calculation
 
 ## Installation
 1. Clone repository:
