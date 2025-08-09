@@ -1,0 +1,450 @@
+import numpy as np
+from datetime import datetime, timedelta
+import rapidfuzz
+import pandas as pd 
+from sklearn.decomposition import PCA
+import re
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.cluster import KMeans
+import nltk
+from nltk.stem import WordNetLemmatizer
+import glob
+import os 
+import warnings
+from typing import TypedDict, List, Dict, Union, Any, Optional
+
+warnings.filterwarnings("ignore")
+
+nltk.download('wordnet')
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger')
+
+class LogEntry(TypedDict):
+    Date: str
+    Time: str
+    Level: str
+    Data: str
+
+class LogProcessor:
+    def __init__(self, logFilePath: Optional[str] = None, 
+                 extensions: Optional[List[str]] = None, 
+                 logPattern: Optional[str] = None):
+        self.logFilePath = logFilePath
+        self.extensions = extensions or ['.log', '.txt']
+        self.logPattern = logPattern or (
+            r'(?P<datetime>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})'
+            r'\s*(?:\+|\-)\d{2}:\d{2}\s*'
+            r'(?:\[|\||\{)(?P<loglevel>[A-Z]+)(?:\]|\||\})\s*'
+            r'(?P<message>.*)'
+        )
+
+    def getLogFiles(self, logFilePath: str) -> List[str]:
+        logFiles = []
+        for ext in self.extensions:
+            logFiles.extend(glob.glob(os.path.join(logFilePath, f'*{ext}')))
+        return logFiles
+
+    @staticmethod
+    def removeTimeZone(timeAspect: str) -> str:
+        if '+' in timeAspect or '-' in timeAspect:
+            return ' '.join(timeAspect.split()[:-1])
+        return timeAspect
+
+    def extractLog(self, log: str) -> tuple:
+        try:
+            logPattern = re.compile(self.logPattern, re.DOTALL)
+            match = logPattern.match(log.strip())
+            if match:
+                logDateTime = match.group('datetime')
+                logLevel = match.group('loglevel')
+                loggedInfo = match.group('message').strip()
+                
+                logDateTimeNoTimezone = self.removeTimeZone(logDateTime)
+                logDate, logTime = logDateTimeNoTimezone.split(' ', 1)
+                return logDate, logTime, logLevel, loggedInfo
+        except:
+            pass
+        
+        # Fallback
+        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', log)
+        time_match = re.search(r'(\d{2}:\d{2}:\d{2}\.\d{3})', log)
+        level_match = re.search(r'([A-Z]{3,5})', log)
+        
+        logDate = date_match.group(1) if date_match else "1970-01-01"
+        logTime = time_match.group(1) if time_match else "00:00:00.000"
+        logLevel = level_match.group(1) if level_match else "INFO"
+        
+        #extract message
+        message = re.sub(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\s*', '', log)
+        message = re.sub(r'[+\-]\d{2}:\d{2}\s*', '', message)
+        message = re.sub(r'^[\[\]{}|]\s*[A-Z]+\s*[\[\]{}|]\s*', '', message)
+        
+        return logDate, logTime, logLevel, message.strip()
+
+    def _processLine(self, file) -> List[LogEntry]:
+        data: List[LogEntry] = []
+        currentLog = ""
+        
+        for line in file:
+            if isinstance(line, bytes):
+                line = line.decode('utf-8', errors='replace')
+            
+            line = line.strip()
+            if not line:
+                continue
+                
+            if re.match(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}', line):
+                if currentLog:
+                    try:
+                        logDate, logTime, logLevel, loggedInfo = self.extractLog(currentLog)
+                        data.append(LogEntry(
+                            Date=logDate,
+                            Time=logTime,
+                            Level=logLevel,
+                            Data=loggedInfo
+                        ))
+                    except Exception as e:
+                        print(f"Skipping log due to error: {e}")
+                currentLog = line
+            else:
+                currentLog += " " + line
+        
+        if currentLog:
+            try:
+                logDate, logTime, logLevel, loggedInfo = self.extractLog(currentLog)
+                data.append(LogEntry(
+                    Date=logDate,
+                    Time=logTime,
+                    Level=logLevel,
+                    Data=loggedInfo
+                ))
+            except Exception as e:
+                print(f"Skipping final log due to error: {e}")
+                
+        return data
+
+    def processLogFile(self, fileInput: Union[str, Any]) -> List[LogEntry]:
+        if isinstance(fileInput, str):
+            try:
+                with open(fileInput, 'r', encoding='utf-8', errors='replace') as file:
+                    return self._processLine(file)
+            except Exception as e:
+                print(f"Error processing file: {e}")
+                return []
+        else:
+            return self._processLine(fileInput)
+
+class LogScrubber:
+    def __init__(self):
+        self.lemmatizer = WordNetLemmatizer()
+        self.stopwords = {'this', 'that', 'and', 'a', 'we', 'it', 'to', 'is', 'of', 'up', 'need', 'i', 'the', 'in', 'for', 'on', 'at', 'by', 'an', 'as'}
+        self.error_keywords = {'error', 'fail', 'exception', 'timeout', 'crash', 'invalid', 'operation', 'notfound', 'io', 'socket', 'security'}
+
+    def createTimeStamp(self, row: Dict) -> datetime:
+        date_str = row['Date']
+        time_str = row['Time']
+        
+        try:
+            if '.' in time_str:
+                if time_str.count('.') == 1:
+                    time_format = "%H:%M:%S.%f"
+                else:
+                    parts = time_str.split('.')
+                    time_str = f"{parts[0]}.{parts[1][:3]}"
+                    time_format = "%H:%M:%S.%f"
+            else:
+                time_format = "%H:%M:%S"
+                
+            time_part = datetime.strptime(time_str, time_format).time()
+            date_part = datetime.strptime(date_str, "%Y-%m-%d").date()
+            return datetime.combine(date_part, time_part)
+        except Exception as e:
+            print(f"Error parsing timestamp: {e} for {date_str} {time_str}")
+            return datetime.now()
+
+    def scrubWords(self, text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        text = re.sub(r"(<.*?>)", "", text)
+        text = re.sub(r"(-|_)", " ", text)
+        text = re.sub(r'\b\w{1}\b', "", text)
+        text = re.sub(r"[^a-zA-Z\s]", "", text)
+        return text.strip()
+
+    def is_hex(self, s: str) -> bool:
+        return re.fullmatch(r'^(0[xX])?[0-9a-fA-F]+$', s or "") is not None
+
+    def extract_key_phrases(self, logLine: str) -> Union[str, None]:
+        if not logLine or not isinstance(logLine, str):
+            return None
+            
+        outputString = logLine.lower()
+        outputString = self.scrubWords(outputString)
+        
+        # Extract exception types
+        exception_types = re.findall(r'\b[a-z]+exception\b', outputString)
+        
+        #split and filter words
+        words = re.split(r"\s+", outputString)
+        filtered_words = [
+            w for w in words
+            if w and 
+            len(w) > 1 and
+            not w.startswith(("0x", "@0x", "[0x", "(0x")) and
+            not self.is_hex(w) and
+            w not in self.stopwords
+        ]
+        
+        #  back error keywords and exception types
+        for keyword in self.error_keywords:
+            if keyword in outputString and keyword not in filtered_words:
+                filtered_words.append(keyword)
+                
+        filtered_words.extend(exception_types)
+        
+        if len(filtered_words) <= 2:
+            return None
+        
+        # error logs return just exception type
+        if "error" in outputString or "exception" in outputString:
+            if exception_types:
+                return exception_types[0]
+            else:
+                # return first 3 words for errors
+                return ' '.join(filtered_words[:3])
+        else:
+            # normal logs return first 5 words
+            return ' '.join(filtered_words[:5])
+
+    def createTimeWindows(self, df: pd.DataFrame, windowSizeMinutes: int = 5) -> List[pd.DataFrame]:
+        if df.empty:
+            print("DataFrame is empty, cannot create time windows")
+            return []
+            
+        if 'TimeStamp' not in df.columns:
+            df['TimeStamp'] = df.apply(self.createTimeStamp, axis=1)
+            
+        df = df.sort_values('TimeStamp').copy()
+        timeWindows = []
+        startTime = df['TimeStamp'].min()
+        endTime = startTime + timedelta(minutes=windowSizeMinutes)
+        
+        while startTime < df['TimeStamp'].max():
+            mask = (df['TimeStamp'] >= startTime) & (df['TimeStamp'] < endTime)
+            window = df.loc[mask].copy()
+            timeWindows.append(window)
+            startTime = endTime
+            endTime = startTime + timedelta(minutes=windowSizeMinutes)
+            
+        return timeWindows
+
+class AdaptiveLogParser:
+    def __init__(self):
+        self.vectorizer = CountVectorizer(token_pattern=r'\b\w+\b', min_df=0.01)
+    
+    def generate_event_templates(self, logs: List[str]) -> List[str]:
+        if not logs:
+            return []
+        
+        # clustering based on data size
+        n_clusters = max(5, min(30, len(logs) // 10))
+        
+        try:
+            X = self.vectorizer.fit_transform(logs)
+            
+            #  few samples
+            if len(logs) < n_clusters:
+                return list(set(logs))
+                
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            clusters = kmeans.fit_predict(X)
+            
+            templates = []
+            for clusterId in range(n_clusters):
+                clusterLogs = [logs[i] for i in range(len(logs)) if clusters[i] == clusterId]
+                if clusterLogs:
+                    # For each cluster, find the most representative log
+                    centroid = kmeans.cluster_centers_[clusterId]
+                    closest_idx = np.argmin(np.linalg.norm(X[clusters == clusterId] - centroid, axis=1))
+                    templates.append(clusterLogs[closest_idx])
+            return templates
+        except Exception as e:
+            print(f"Clustering failed: {e}")
+            return list(set(logs))
+
+class AdaptiveAnomalyDetector:
+    def __init__(self):
+        self.pca = None
+        self.mean_vector = None
+        self.threshold = None
+        self.templates = []
+    
+    def fit(self, eventMatrix: np.ndarray):
+        if eventMatrix.size == 0 or eventMatrix.shape[0] < 5:
+            print("Not enough data to train detector")
+            return
+            
+        #pca components
+        n_components = min(10, eventMatrix.shape[1] - 1, eventMatrix.shape[0] - 1)
+        self.pca = PCA(n_components=n_components)
+        self.pca.fit(eventMatrix)
+        
+        #reconstruction error
+        reconstructed = self.pca.inverse_transform(self.pca.transform(eventMatrix))
+        residuals = eventMatrix - reconstructed
+        spe = np.sum(residuals**2, axis=1)
+        
+       
+        spe_99 = np.percentile(spe, 99) if len(spe) > 10 else np.max(spe)
+        spe_max = np.max(spe)
+        self.threshold = max(spe_99, spe_max * 1.1)
+        
+        print(f"Training stats: min={np.min(spe):.2f}, max={spe_max:.2f}, "
+              f"99%={spe_99:.2f}, threshold={self.threshold:.2f}")
+
+    def detect_anomalies(self, eventMatrix: np.ndarray) -> tuple:
+        if self.pca is None or eventMatrix.size == 0:
+            return np.array([]), np.array([])
+            
+        reconstructed = self.pca.inverse_transform(self.pca.transform(eventMatrix))
+        residuals = eventMatrix - reconstructed
+        spe = np.sum(residuals**2, axis=1)
+        anomalies = spe > self.threshold
+        
+        return spe, anomalies
+
+# main execution
+if __name__ == "__main__":
+    log_file_to_use = r'C:\Users\omegam\Documents\python\anomally\Innova.MarketStatistics.Download.Service20240630 1.txt'
+    
+    print("Processing log file...")
+    log_processor = LogProcessor()
+    log_data = log_processor.processLogFile(log_file_to_use)
+    if not log_data:
+        print("No log entries found! Check your log file and parsing logic.")
+        exit()
+    
+    print(f"Processed {len(log_data)} log entries")
+    log_df = pd.DataFrame(log_data)
+    
+    print("Cleaning and preprocessing logs...")
+    log_scrubber = LogScrubber()
+    log_df['TimeStamp'] = log_df.apply(log_scrubber.createTimeStamp, axis=1)
+    log_df['clean_message'] = log_df['Data'].apply(log_scrubber.extract_key_phrases)
+    
+    cleaned_count = log_df['clean_message'].notna().sum()
+    print(f"Cleaned {cleaned_count}/{len(log_df)} messages successfully")
+    
+    print("Creating time windows...")
+    time_windows = log_scrubber.createTimeWindows(log_df)
+    print(f"Created {len(time_windows)} time windows")
+    
+   #mark windows with errors
+    ground_truth = []
+    for window in time_windows:
+        if not window.empty and (window['Level'] == 'ERR').any():
+            ground_truth.append(1)
+        else:
+            ground_truth.append(0)
+    
+    print("Generating event templates...")
+    parser = AdaptiveLogParser()
+    all_logs = log_df['clean_message'].dropna().tolist()
+    event_templates = parser.generate_event_templates(all_logs)
+    print(f"Generated {len(event_templates)} event templates")
+    
+    #sample templates
+    print("Sample templates:")
+    for i, template in enumerate(event_templates[:5]):
+        print(f"  {i+1}. {template}")
+    
+    print("Building event matrix...")
+    detector = AdaptiveAnomalyDetector()
+    
+    #event matrix
+    event_matrix = np.zeros((len(time_windows), len(event_templates)), dtype=int)
+    for i, window in enumerate(time_windows):
+        if window.empty:
+            continue
+        for message in window['clean_message'].dropna():
+            # exact match or high similarity
+            if message in event_templates:
+                idx = event_templates.index(message)
+                event_matrix[i, idx] += 1
+            else:
+                #similar  similar template
+                result = rapidfuzz.process.extractOne(
+                    message, 
+                    event_templates,
+                    scorer=rapidfuzz.fuzz.token_set_ratio,
+                    score_cutoff=70
+                )
+                if result:
+                    idx = event_templates.index(result[0])
+                    event_matrix[i, idx] += 1
+    
+    print("Training anomaly detector...")
+    # normal windows for training
+    normal_indices = [i for i, window in enumerate(time_windows) 
+                     if not window.empty and (window['Level'] != 'ERR').all()]
+    
+    if not normal_indices:
+        print("No normal windows found for training!")
+        exit()
+    
+    normal_matrix = event_matrix[normal_indices]
+    detector.fit(normal_matrix)
+    
+    print("Detecting anomalies...")
+    spe_scores, anomalies = detector.detect_anomalies(event_matrix)
+    
+    # performance evaluation
+    print("\n=== Results ===")
+    true_positives = 0
+    false_positives = 0
+    false_negatives = 0
+    
+    for i in range(len(time_windows)):
+        if anomalies[i] and ground_truth[i]:
+            true_positives += 1
+        elif anomalies[i] and not ground_truth[i]:
+            false_positives += 1
+        elif not anomalies[i] and ground_truth[i]:
+            false_negatives += 1
+    
+    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    
+    print(f"True Positives: {true_positives}")
+    print(f"False Positives: {false_positives}")
+    print(f"False Negatives: {false_negatives}")
+    print(f"Precision: {precision:.2f}")
+    print(f"Recall: {recall:.2f}")
+    print(f"F1 Score: {f1:.2f}")
+    
+    # Detailed anomaly report
+    anomaly_indices = np.where(anomalies)[0]
+    print(f"\nDetected {len(anomaly_indices)} anomalous windows:")
+    
+    for idx in anomaly_indices[:10]:  #first 10
+        window = time_windows[idx]
+        start_time = window['TimeStamp'].min()
+        end_time = window['TimeStamp'].max()
+        error_count = (window['Level'] == 'ERR').sum()
+        print(f"f {idx+1} ({start_time} to {end_time}):")
+        print(f"  SPE score: {spe_scores[idx]:.2f} (threshold: {detector.threshold:.2f})")
+        print(f"  Log count: {len(window)}")
+        print(f"  Errors: {error_count}")
+        
+        # unique log types
+        unique_logs = window['clean_message'].unique()
+        print("  Key messages:")
+        for msg in unique_logs[:3]:
+            print(f"    - {msg}")
+        print()
+    
+    # Matrix diagnostics
+    sparsity = 1 - np.count_nonzero(event_matrix) / event_matrix.size
+    print(f"Event matrix sparsity: {sparsity:.1%}")
+    print(f"Min SPE: {np.min(spe_scores):.2f}, Max SPE: {np.max(spe_scores):.2f}")
